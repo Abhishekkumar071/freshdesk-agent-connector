@@ -214,7 +214,7 @@ Every connector call is a GET, so retrying is safe (idempotent).
 | High-priority open tickets | search `"(priority:3 OR priority:4) AND status:2"` | 1 | — |
 | Tickets about payment failures | (a) native: `tag:'payment'` / `type:'...'` if the merchant uses them; (b) bounded keyword match, see below | 1–3 | Keyword match is not exhaustive |
 | Details of ticket 12345 | `GET /tickets/12345?include=requester,stats` | 1 + embeds | — |
-| Oldest unresolved tickets | search unresolved, scan ≤ 3 pages, sort by `created_at` in the connector | 1–3 | Exact when ≤ 90 match; otherwise flagged non-exhaustive. Does not rely on Freshdesk's (undocumented) search order |
+| Oldest unresolved tickets | search unresolved, scan ≤ 3 pages, sort by `created_at` in the connector | 1–3 | Exact when ≤ 90 match, whatever order Freshdesk uses. With more than 90, *which* 90 get scanned depends on Freshdesk's undocumented order, so the result is flagged non-exhaustive |
 | Search for a specific issue | same as payment failures | 1–3 | same |
 
 ### Keyword search: feasibility (resolves Phase 1 §8)
@@ -265,6 +265,7 @@ The account had 3 sample tickets (IDs 1–3), all status Open, created within 2 
 | Search: page 11 | 400 `page: It should be a Positive Integer less than or equal to 10` | ✅ |
 | Search: `subject:'...'` | 400 `subject: Unexpected/invalid field in request` | ✅ confirms no subject/free-text search |
 | Search: `created_at:>'YYYY-MM-DD'` base query | accepted, `total=3` | ✅ keyword-only base query works |
+| Search: date bounds inclusive? (checked in Phase 8) | all 3 tickets were created 2026-10-04; `created_at:<'2026-10-04'` → 3 and `created_at:>'2026-10-04'` → 3 | ✅ both bounds include the whole day, matching our "on or before / on or after" wording |
 | Search: priority + status combo | correct (1 result, ticket 2) | ✅ |
 | Search: `tag:'...'` | **Not verified** — sample tickets have no tags | — |
 | Search sort order | page 1 came back `[3,2,1]`: consistent with `created_at` desc **and** with `updated_at` desc **and** with ID desc | **Inconclusive** — these 3 tickets can't tell the three orders apart |

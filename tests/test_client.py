@@ -242,6 +242,18 @@ async def test_429_without_retry_after_uses_backoff(api, client, sleep):
     assert 0.375 <= sleep.calls[0] <= 0.625  # 0.5s +/- 25% jitter
 
 
+@pytest.mark.parametrize("value", ["inf", "1e309", "nan", "-5", "Wed, 21 Oct 2026 07:28:00 GMT"])
+async def test_unusable_retry_after_falls_back_to_backoff(api, client, sleep, value):
+    api.get("/tickets").mock(
+        side_effect=[httpx.Response(429, headers={"Retry-After": value}), httpx.Response(200, json=[])]
+    )
+
+    await client.list_tickets()
+
+    assert len(sleep.calls) == 1
+    assert 0.375 <= sleep.calls[0] <= 0.625
+
+
 async def test_429_with_long_retry_after_fails_fast(api, client, sleep):
     route = api.get("/tickets").respond(429, headers={"Retry-After": "45"})
 
@@ -327,6 +339,16 @@ async def test_connection_error_raises_network_error(api, client):
 
     assert route.call_count == 3
     assert excinfo.value.message == "Could not reach Freshdesk."
+
+
+async def test_undecodable_body_is_unexpected_response_and_not_retried(api, client, sleep):
+    route = api.get("/tickets").mock(side_effect=httpx.DecodingError("bad gzip"))
+
+    with pytest.raises(UnexpectedResponse):
+        await client.list_tickets()
+
+    assert route.call_count == 1
+    assert sleep.calls == []
 
 
 async def test_single_attempt_configuration_does_not_retry(api, settings, sleep):

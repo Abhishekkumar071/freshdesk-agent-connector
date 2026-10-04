@@ -55,7 +55,7 @@ Use for questions like "unresolved tickets", "high-priority open tickets" or
 Freshdesk cannot search text, so `keyword` is matched by this connector over at
 most {SCAN_MAX_TICKETS} tickets that match the other filters (search_mode
 "keyword_scan"). order="oldest_first" also sorts at most {SCAN_MAX_TICKETS}
-tickets in the connector, and then only pages 1-3 exist. In both cases `scanned`
+tickets in the connector. With a keyword or oldest_first, only pages 1-3 exist. In both cases `scanned`
 and `exhaustive` are set: if `exhaustive` is false, more matching tickets may
 exist, so tell the user or add filters (such as status or a date range) to narrow
 the search."""

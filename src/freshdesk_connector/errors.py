@@ -1,7 +1,8 @@
 """Error types raised by the connector.
 
 Every error carries a `message` that is safe to show to the agent: it is written
-by the connector, never copied from a raw response, and never contains secrets.
+by the connector and never contains secrets. The only response text passed on is
+Freshdesk's field-level validation message for HTTP 400, truncated.
 """
 
 

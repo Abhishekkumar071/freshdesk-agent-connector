@@ -32,6 +32,16 @@ def freshdesk_service_factory(settings: Settings):
     return factory
 
 
+def configure_logging(level: str) -> None:
+    # stdout carries the MCP protocol on stdio, so logs must go to stderr.
+    logging.basicConfig(stream=sys.stderr, level=level,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if level != "DEBUG":
+        # httpx logs every full request URL at INFO; the client already logs the
+        # path, status and timing, so keep httpx's own lines for debugging only.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only Freshdesk ticket MCP server.")
     parser.add_argument("--transport", choices=["stdio", "http"], default="stdio")
@@ -41,9 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args(argv)
 
-    # stdout carries the MCP protocol on stdio, so logs must go to stderr.
-    logging.basicConfig(stream=sys.stderr, level=args.log_level,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure_logging(args.log_level)
 
     try:
         settings = Settings()

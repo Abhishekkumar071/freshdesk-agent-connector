@@ -14,7 +14,7 @@ import respx
 from mcp import Client
 
 from conftest import load_fixture
-from freshdesk_connector.__main__ import freshdesk_service_factory, main
+from freshdesk_connector.__main__ import configure_logging, freshdesk_service_factory, main
 from freshdesk_connector.config import Settings
 from freshdesk_connector.errors import NotFound, RateLimited
 from freshdesk_connector.models import SearchResult, TicketDetail, TicketPage, TicketSummary
@@ -315,6 +315,17 @@ async def test_end_to_end_auth_failure(settings, freshdesk):
 
 
 # --- entry point --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("level", "httpx_level"), [("INFO", logging.WARNING), ("DEBUG", logging.NOTSET)])
+def test_configure_logging_keeps_httpx_urls_out_of_info_logs(level, httpx_level):
+    httpx_logger = logging.getLogger("httpx")
+    httpx_logger.setLevel(logging.NOTSET)
+    try:
+        configure_logging(level)
+        assert httpx_logger.level == httpx_level
+    finally:
+        httpx_logger.setLevel(logging.NOTSET)
 
 
 def test_main_reports_missing_config_without_values(monkeypatch, capsys, tmp_path):

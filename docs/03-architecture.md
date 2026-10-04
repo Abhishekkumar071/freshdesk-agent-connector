@@ -223,7 +223,9 @@ Search routes to one of three paths:
 | Oldest-first scan | no keyword, `oldest_first` | ≤ 3 | scan ≤ 90 matches, sort by `created_at` ascending **in the connector**, page locally (pages 1–3) |
 | Keyword scan | `keyword` given | ≤ 3 | scan ≤ 90 candidates, match locally, sort per `order`, page locally (pages 1–3) |
 
-**Oldest-first (decision A).** The trial could not show which order Freshdesk search uses (docs/02 §11.1), so the connector does not depend on it. It reads up to 3 pages and sorts them itself. If `total` ≤ 90 the answer is exact (`exhaustive=True`). Otherwise `exhaustive=False` and a note tells the agent to narrow with `created_before`/`created_after`. The earlier "fetch the last page" idea is dropped.
+**Oldest-first (decision A).** The trial could not show which order Freshdesk search uses (docs/02 §11.1). The connector reads up to 3 pages and sorts them itself. If `total` ≤ 90 the answer is exact whatever Freshdesk's order (`exhaustive=True`). With more than 90 matches, *which* 90 are scanned depends on Freshdesk's order, so the result is `exhaustive=False` and a note tells the agent to narrow with `created_before`/`created_after` to get an exact answer. The earlier "fetch the last page" idea is dropped. It would have relied on the undocumented order even for small result sets.
+
+Likewise, native `newest_first` sorts within each page, but which tickets land on which page is Freshdesk's choice. Page 1 being the newest matches is likely (it is consistent with the trial and the community reports) but not documented.
 
 **Keyword scan.** Base query = the native filters, or `created_at:>'<today − 365 days>'` when none are given (confirmed accepted on the trial). Match = every word (case-insensitive) appears in subject + plain-text description (the trial confirmed search results include `description_text`). `exhaustive = scanned >= total`. Keyword length is 2–100 characters. There is no stemming or fuzzy matching.
 
@@ -233,7 +235,7 @@ Limits are module constants: `LIST_MAX_PAGE=10`, `LIST_MAX_PAGE_SIZE=50`, `SCAN_
 - page 2 or 3 fails with a temporary error (`RateLimited`, `ServiceUnavailable`, `RequestTimeout`, `NetworkError`), or
 - 15 s have passed before the next page would start.
 
-Permanent errors, and any failure on page 1, are still raised. Tickets are de-duplicated by ID across pages, in case data shifts between requests.
+Permanent errors, and any failure on page 1, are still raised. Tickets are de-duplicated by ID across pages, in case data shifts between requests. If a page comes back short while fewer tickets than Freshdesk's `total` have been read, the result is flagged with the reason "Freshdesk's results changed while paging". A ticket that moves across a page boundary while we page through *can't* be detected; this is a documented limitation.
 
 **Status catalog recovery (Phase 7).** If `ticket_fields` fails at startup, the service uses the built-in statuses and retries on a later tool call, at most once per 60 s. Until it succeeds, every list and search result carries a note saying custom statuses aren't recognised.
 

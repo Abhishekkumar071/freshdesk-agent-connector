@@ -309,8 +309,11 @@ class TicketService:
             for ticket in result.tickets:
                 by_id.setdefault(ticket.get("id"), ticket)
             total = result.total
-            if len(by_id) >= total or len(result.tickets) < SEARCH_PAGE_SIZE:
+            if len(by_id) >= total:
                 break
+            if len(result.tickets) < SEARCH_PAGE_SIZE:
+                # Fewer tickets than Freshdesk's own total, without hitting our cap.
+                return _Scan(list(by_id.values()), total, "Freshdesk's results changed while paging")
         return _Scan(list(by_id.values()), total, None)
 
     async def _retry_statuses_if_needed(self) -> None:

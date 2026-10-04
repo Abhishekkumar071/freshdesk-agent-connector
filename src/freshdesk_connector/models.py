@@ -11,7 +11,9 @@ class TicketSummary(BaseModel):
     id: int
     subject: str
     status: str = Field(description='Status label, e.g. "open", "pending", "waiting_on_customer".')
-    priority: str = Field(description='"low", "medium", "high" or "urgent".')
+    priority: str = Field(
+        description='"low", "medium", "high" or "urgent" ("priority_<n>" for an unknown code).'
+    )
     type: str | None
     tags: list[str]
     created_at: datetime

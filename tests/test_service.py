@@ -449,6 +449,17 @@ async def test_scan_stops_at_time_budget():
     assert "time limit" in result.notes[0]
 
 
+async def test_scan_short_page_below_total_is_reported_as_changed_results():
+    # Freshdesk says 40 match but page 2 holds only 5 (e.g. tickets changed while paging).
+    client = FakeClient(search_results=[raw_ticket(i) for i in range(1, 36)], total=40)
+
+    result = await make_service(client).search_tickets(status=["open"], order="oldest_first")
+
+    assert result.scanned == 35 and result.exhaustive is False
+    assert "results changed while paging" in result.notes[0]
+    assert "limit" not in result.notes[0]
+
+
 async def test_scan_deduplicates_tickets_that_shift_between_pages():
     page1 = [raw_ticket(i) for i in range(60, 30, -1)]  # ids 60..31
     page2 = [raw_ticket(31)] + [raw_ticket(i) for i in range(30, 1, -1)]  # 31 again, then 30..2

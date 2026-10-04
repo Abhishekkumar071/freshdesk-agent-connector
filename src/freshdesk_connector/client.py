@@ -10,6 +10,7 @@ The client exposes GET requests only. There is deliberately no generic
 
 import asyncio
 import logging
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -161,6 +162,10 @@ class FreshdeskClient:
             except httpx.TransportError as exc:
                 error = NetworkError("Could not reach Freshdesk.")
                 logger.warning("GET %s network error=%s attempt=%d", path, type(exc).__name__, attempt)
+            except httpx.RequestError as exc:
+                # e.g. DecodingError (corrupt compressed body): a bad response, not worth retrying.
+                logger.warning("GET %s unreadable response error=%s", path, type(exc).__name__)
+                raise UnexpectedResponse("Freshdesk returned a response that could not be read.") from None
             else:
                 _log_response(path, response, attempt, started)
                 if response.is_success:
@@ -234,7 +239,7 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         seconds = float(response.headers["Retry-After"])
     except (KeyError, ValueError):
         return None
-    return seconds if seconds >= 0 else None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def _rate_limit_message(retry_after: float | None) -> str:
