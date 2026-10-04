@@ -57,12 +57,15 @@ most {SCAN_MAX_TICKETS} tickets that match the other filters (search_mode
 "keyword_scan"). order="oldest_first" also sorts at most {SCAN_MAX_TICKETS}
 tickets in the connector. With a keyword or oldest_first, only pages 1-3 exist. In both cases `scanned`
 and `exhaustive` are set: if `exhaustive` is false, more matching tickets may
-exist, so tell the user or add filters (such as status or a date range) to narrow
-the search."""
+exist, so tell the user, or follow the note's suggestion (usually created_before)
+to continue the search.
+
+If the account tags or types its tickets (for example tag "payment"), filtering by
+`tag` or `ticket_type` is complete and cheaper than a keyword scan."""
 
 Order = Annotated[
     Literal["newest_first", "oldest_first"],
-    Field(description="Sort by creation time."),
+    Field(description="Sort direction."),
 ]
 
 
@@ -142,9 +145,14 @@ def create_server(service_factory: ServiceFactory) -> MCPServer:
         keyword: Annotated[
             str | None,
             Field(min_length=KEYWORD_MIN_CHARS, max_length=KEYWORD_MAX_CHARS,
-                  description="Words that must all appear in the subject or description (case-insensitive)."),
+                  description="Words that must all appear in the subject or description (case-insensitive "
+                              "substring match, no stemming: use short stems, e.g. \"fail\" matches "
+                              "\"failed\" and \"failure\")."),
         ] = None,
-        order: Order = "newest_first",
+        order: Annotated[
+            Literal["newest_first", "oldest_first"],
+            Field(description="Sort by ticket creation time."),
+        ] = "newest_first",
         page: Annotated[int, Field(ge=1, le=SEARCH_MAX_PAGE)] = 1,
     ) -> SearchResult:
         return await _call(ctx, "search_tickets", lambda s: s.search_tickets(

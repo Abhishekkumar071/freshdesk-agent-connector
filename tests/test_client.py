@@ -404,6 +404,26 @@ async def test_warns_when_rate_limit_nearly_used(api, client, caplog):
     assert any("nearly used" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+    ("total", "remaining", "warns"),
+    [
+        ("50.0", "3.0", True),  # format observed on the live trial account
+        ("50", "49.0", False),
+        ("50", "garbage", False),
+        ("inf", "3", False),
+    ],
+)
+async def test_low_quota_warning_handles_real_header_formats(api, client, caplog, total, remaining, warns):
+    api.get("/tickets").respond(
+        200, json=[], headers={"X-RateLimit-Total": total, "X-RateLimit-Remaining": remaining}
+    )
+
+    with caplog.at_level(logging.INFO, logger="freshdesk_connector"):
+        await client.list_tickets()
+
+    assert any("nearly used" in r.getMessage() for r in caplog.records) is warns
+
+
 # --- security --------------------------------------------------------------------
 
 

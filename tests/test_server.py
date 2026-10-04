@@ -111,7 +111,9 @@ async def test_input_schemas_carry_bounds_and_enums(client):
     assert list_props["page"]["maximum"] == 10
     assert list_props["page_size"]["maximum"] == 50
     assert list_props["order"]["enum"] == ["newest_first", "oldest_first"]
+    assert list_props["order"]["description"] == "Sort direction."  # order_by may be updated_at
     assert "required" not in tools["list_tickets"]
+    assert "creation time" in tools["search_tickets"]["properties"]["order"]["description"]
 
     search = json.dumps(tools["search_tickets"])
     for expected in ('"low"', '"urgent"', '"maxLength": 100', '"minLength": 2', "unresolved"):

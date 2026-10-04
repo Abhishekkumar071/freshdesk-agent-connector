@@ -221,9 +221,11 @@ class TicketService:
 
         notes = self._base_notes()
         if not scan.exhaustive():
+            # The true oldest matches are always created on or before the earliest
+            # scanned day, whatever order Freshdesk returned them in.
             notes.append(
                 _not_exhaustive_note(scan, "older matching tickets may exist")
-                + " Narrow with created_before/created_after for an exact answer."
+                + _narrowing_hint(scan, "to find older ones")
             )
         return SearchResult(
             search_mode="native",
@@ -267,11 +269,13 @@ class TicketService:
         if not scan.exhaustive():
             notes.append(
                 _not_exhaustive_note(scan, "more matching tickets may exist")
-                + " Add filters such as status or a date range to narrow the candidates."
+                + _narrowing_hint(scan, "to scan older tickets")
+                + " Adding filters such as status, tag or ticket_type also narrows the candidates."
             )
         notes.append(
             "Keyword matching is a case-insensitive text match on subject and description; "
-            "every word must appear."
+            "every word must appear. `total` counts candidate tickets matching the other filters; "
+            "`matched` counts those containing the keyword."
         )
         return SearchResult(
             search_mode="keyword_scan",
@@ -330,8 +334,20 @@ class TicketService:
         return [to_summary(raw, self._statuses, self._domain) for raw in raw_tickets]
 
 
+def _narrowing_hint(scan: _Scan, purpose: str) -> str:
+    """Tell the agent exactly how to continue past a bounded scan."""
+    days = [t["created_at"][:10] for t in scan.tickets if isinstance(t.get("created_at"), str)]
+    if not days:
+        return " Narrow with created_before/created_after."
+    earliest = min(days)
+    return (f" The scanned tickets were created on or after {earliest}; {purpose}, "
+            f'search again with created_before="{earliest}".')
+
+
 def _reason(exc: ConnectorError) -> str:
     if isinstance(exc, RateLimited):
+        if exc.retry_after is not None:
+            return f"Freshdesk's rate limit was reached (retry in about {round(exc.retry_after)} seconds)"
         return "Freshdesk's rate limit was reached"
     if isinstance(exc, ServiceUnavailable):
         return "Freshdesk was temporarily unavailable"

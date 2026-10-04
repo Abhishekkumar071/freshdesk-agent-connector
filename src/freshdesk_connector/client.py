@@ -273,7 +273,16 @@ def _log_response(path: str, response: httpx.Response, attempt: int, started: fl
         "GET %s status=%d attempt=%d ms=%d ratelimit_remaining=%s",
         path, response.status_code, attempt, elapsed_ms, remaining,
     )
-    total = response.headers.get("X-RateLimit-Total")
-    if remaining and total and remaining.isdigit() and total.isdigit():
-        if int(remaining) < int(total) * LOW_QUOTA_FRACTION:
-            logger.warning("Freshdesk rate limit nearly used: %s of %s calls left", remaining, total)
+    left = _header_number(response, "X-RateLimit-Remaining")
+    limit = _header_number(response, "X-RateLimit-Total")
+    if left is not None and limit is not None and left < limit * LOW_QUOTA_FRACTION:
+        logger.warning("Freshdesk rate limit nearly used: %g of %g calls left", left, limit)
+
+
+def _header_number(response: httpx.Response, name: str) -> float | None:
+    """Freshdesk sends some counters as "49" and others as "49.0"."""
+    try:
+        value = float(response.headers[name])
+    except (KeyError, ValueError):
+        return None
+    return value if math.isfinite(value) else None

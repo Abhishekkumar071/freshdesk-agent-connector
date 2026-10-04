@@ -307,6 +307,27 @@ async def test_oldest_first_is_flagged_non_exhaustive_beyond_scan_limit():
     assert result.scanned == 90 and result.total == 200
     assert result.exhaustive is False
     assert result.notes[0].startswith("Not exhaustive")
+    # Tells the agent exactly how to continue: earliest scanned ticket is 2026-01-01T01:00.
+    assert 'search again with created_before="2026-01-01"' in result.notes[0]
+
+
+async def test_narrowing_hint_without_dates_falls_back_to_generic_advice():
+    undated = [raw_ticket(i, subject="other") | {"created_at": None} for i in range(1, 91)]
+    client = FakeClient(search_results=undated, total=500)
+
+    result = await make_service(client).search_tickets(status=["open"], keyword="refund")
+
+    assert "Narrow with created_before/created_after." in result.notes[0]
+
+
+async def test_rate_limited_scan_note_includes_retry_time():
+    client = FakeClient(search_results=[raw_ticket(i) for i in range(1, 91)],
+                        page_errors={2: RateLimited("limit", retry_after=42.4)})
+
+    result = await make_service(client).search_tickets(status=["open"], keyword="subject")
+
+    assert "retry in about 42 seconds" in result.notes[0]
+    assert "created_before=" in result.notes[0]
 
 
 async def test_oldest_first_with_no_matches():
