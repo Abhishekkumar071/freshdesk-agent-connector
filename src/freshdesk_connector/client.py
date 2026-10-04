@@ -141,6 +141,13 @@ class FreshdeskClient:
             raise UnexpectedResponse("Unexpected search result format from Freshdesk.")
         return TicketSearchPage(tickets=results, total=total)
 
+    async def list_ticket_fields(self) -> list[dict[str, Any]]:
+        """GET /ticket_fields. Used once at startup to read the account's status names."""
+        body = _json(await self._get("/ticket_fields"))
+        if not isinstance(body, list):
+            raise UnexpectedResponse("Unexpected ticket field format from Freshdesk.")
+        return body
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
         """GET with bounded retries on 429, 5xx, timeouts and network errors."""
         for attempt in range(1, self._max_attempts + 1):

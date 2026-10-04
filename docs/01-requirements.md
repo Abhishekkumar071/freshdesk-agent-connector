@@ -44,11 +44,11 @@ The underlying need is **safe, structured, read-only access to support data for 
 
 | Question | Expected tool path |
 |---|---|
-| Show me the latest unresolved tickets | `list_tickets` / `search_tickets` (status open+pending), newest first |
+| Show me the latest unresolved tickets | `search_tickets` (status unresolved), newest first |
 | Find high-priority open tickets | `search_tickets` (priority high/urgent, status open) |
 | Find tickets related to payment failures | `search_tickets` (native filters, e.g. tag) + bounded keyword match — see §8 |
 | Give me the details of ticket 12345 | `get_ticket` |
-| Which unresolved tickets are the oldest? | Unresolved filter + oldest-first ordering — feasibility **[Verify P2]** |
+| Which unresolved tickets are the oldest? | `search_tickets` (unresolved, oldest_first) — sorted in the connector, ≤ 90 scanned |
 | Search for tickets containing a specific issue | `search_tickets` keyword (bounded) |
 
 ---
@@ -108,7 +108,7 @@ Exact feasibility, caps, and limitations to be confirmed in Phase 2 before any i
 | K1 | Native search may not support free text **[Verify P2]** | "payment failures" query weak | Option (c) + documented limitation |
 | K2 | List endpoint may default to recent tickets only (~30 days) **[Verify P2]** | Agent states wrong totals | Document in tool description; expose date params if supported |
 | K3 | Search API may cap results and not allow custom sort **[Verify P2]** | "Oldest unresolved" hard | Bounded fetch + connector-side sort, or list endpoint ordering; decide in P2/P3 |
-| K4 | Custom statuses (merchant-defined) | "Unresolved" mapping incomplete | Default Open+Pending; document; unknown codes surfaced as `"custom:<id>"` |
+| K4 | Custom statuses (merchant-defined) | "Unresolved" mapping incomplete | Resolved in Phase 5: status names loaded from `ticket_fields` at startup |
 | K5 | Plan-dependent rate limits; embeds cost extra credits **[Verify P2]** | 429s during demo | Bounded retries, `Retry-After`, minimal embeds |
 | K6 | Trial account availability for demo | Phase 9 blocked | Create trial early; mocked demo fallback |
 | K7 | 48-hour deadline vs 10 gated phases | Incomplete submission | Short docs-phases; protect time for phases 4–9 |
@@ -117,7 +117,7 @@ Exact feasibility, caps, and limitations to be confirmed in Phase 2 before any i
 
 - One merchant / one Freshdesk domain per deployment.
 - API-key auth satisfies "working authentication flow" (to be confirmed in Phase 2).
-- "Unresolved" = Open + Pending by default.
+- "Unresolved" = every status except Resolved and Closed, including merchant-defined statuses (updated in Phase 5 after the trial showed custom statuses).
 - Consumer is an MCP-compatible client (Agent Studio, Claude Desktop, MCP Inspector for demo).
 - Where a ticket description is returned to the agent (at least in `get_ticket`), it is plain text, truncated to a safe length. Which endpoints return it, and at what API cost, is checked in Phase 2.
 - Automated tests never call real Freshdesk; only the Phase 9 demo does.

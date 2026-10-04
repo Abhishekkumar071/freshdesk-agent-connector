@@ -71,7 +71,7 @@ Codes **[Docs]**:
 
 **Custom statuses:** merchants can add statuses; they get codes outside 2–5. Their names are only available from the ticket-fields endpoint (`GET /api/v2/ticket_fields`). **[Check on trial]** for exact shape.
 
-**Connector decision:** map 2–5 to labels; any other status code is surfaced as `"custom_<code>"` and never silently dropped. Reading `ticket_fields` to resolve custom names is a future improvement, not in scope. "Unresolved" = `open` + `pending` (2, 3); tickets in custom statuses are **not** counted as unresolved — documented limitation.
+**Connector decision (updated after the trial check, §11.1):** read status names from `ticket_fields` once at startup. "Unresolved" = every status except Resolved (4) and Closed (5), so custom statuses are included. Unknown codes are surfaced as `"status_<code>"`. If `ticket_fields` can't be read, the four built-in statuses are used.
 
 Requester details are **not** in the ticket body, only `requester_id`. Getting name/email costs an `include=requester` embed (see §7).
 
@@ -210,11 +210,11 @@ Every connector call is a GET, so retrying is safe (idempotent).
 
 | Question | Plan | API calls | Caveat |
 |---|---|---|---|
-| Latest unresolved tickets | search `"status:2 OR status:3"`, page 1 | 1 | "Latest" = most recently **created**; search can't order by `updated_at` |
+| Latest unresolved tickets | search all non-resolved/closed statuses (incl. custom), page 1 | 1 | "Latest" = most recently **created**; search can't order by `updated_at` |
 | High-priority open tickets | search `"(priority:3 OR priority:4) AND status:2"` | 1 | — |
 | Tickets about payment failures | (a) native: `tag:'payment'` / `type:'...'` if the merchant uses them; (b) bounded keyword match, see below | 1–3 | Keyword match is not exhaustive |
 | Details of ticket 12345 | `GET /tickets/12345?include=requester,stats` | 1 + embeds | — |
-| Oldest unresolved tickets | search unresolved, read `total`, fetch the **last** page (results are newest-first) | 2 | Only works when `total` ≤ 300; above that, narrow with `created_at:<'date'` or report the limit. Relies on the **[Community]** sort order |
+| Oldest unresolved tickets | search unresolved, scan ≤ 3 pages, sort by `created_at` in the connector | 1–3 | Exact when ≤ 90 match; otherwise flagged non-exhaustive. Does not rely on Freshdesk's (undocumented) search order |
 | Search for a specific issue | same as payment failures | 1–3 | same |
 
 ### Keyword search: feasibility (resolves Phase 1 §8)
@@ -243,6 +243,35 @@ curl -s -u "$FRESHDESK_API_KEY:X" "https://$FRESHDESK_DOMAIN/api/v2/search/ticke
 ```
 
 If any check contradicts these notes, this document gets updated before the code changes.
+
+### 11.1 Live smoke test results (2026-10-04, trial account, 17 GET calls)
+
+The account had 3 sample tickets (IDs 1–3), all status Open, created within 2 seconds of each other.
+
+| Check | Observed | vs. notes |
+|---|---|---|
+| Auth (Basic, key:X) | 200 | ✅ as documented |
+| Wrong key | 401 → `AuthenticationFailed` | ✅ |
+| Missing ticket | 404 → `NotFound` | ✅ |
+| Rate-limit headers | `X-RateLimit-Total: 50`, `Remaining`, `Used-CurrentRequest` present | ✅ trial = 50/min |
+| `include=requester,stats` cost | `Used-CurrentRequest: 2` (plain GET = 1) | Resolves the docs inconsistency for this case: 2 credits total |
+| `requester` embed fields | `id, name, email, phone, mobile, contact_type, ip_address, first_seen, last_seen` | More PII than documented (IP, activity times). We keep name + email only |
+| List: description | absent (no `include`) | ✅ |
+| List: `Link` pagination | `per_page=2`: page 1 `has_next=True`, page 2 `has_next=False` | ✅ |
+| List: `order_type` asc/desc on `created_at` | `[1,2,3]` / `[3,2,1]` | ✅ |
+| List: 30-day default window | **Not verifiable** — all tickets are new | — |
+| Search: `description` **and** `description_text` in results | both present, non-empty | Better than the docs example: keyword match can use `subject` + `description_text` at no extra cost |
+| Search: page past the end | page 2 with `total=3` → 200, empty `results` | Not an error; good |
+| Search: page 11 | 400 `page: It should be a Positive Integer less than or equal to 10` | ✅ |
+| Search: `subject:'...'` | 400 `subject: Unexpected/invalid field in request` | ✅ confirms no subject/free-text search |
+| Search: `created_at:>'YYYY-MM-DD'` base query | accepted, `total=3` | ✅ keyword-only base query works |
+| Search: priority + status combo | correct (1 result, ticket 2) | ✅ |
+| Search: `tag:'...'` | **Not verified** — sample tickets have no tags | — |
+| Search sort order | page 1 came back `[3,2,1]`: consistent with `created_at` desc **and** with `updated_at` desc **and** with ID desc | **Inconclusive** — these 3 tickets can't tell the three orders apart |
+| Search: cross-page order / last-page trick | **Not verifiable** — needs > 30 matching tickets | — |
+| Custom statuses | `ticket_fields` lists `6 Waiting on Customer`, `7 Waiting on Third Party`, `9000 Assigned to AI Agent`, in addition to 2–5 | **Differs from assumption**: a fresh trial already has custom statuses. "Unresolved = 2+3" would miss them |
+| Extra fields not in docs | `nr_due_by`, `nr_escalated`, `structured_description`, `support_email`, `source_info`, `associated_tickets_count`, ... | Harmless; normalization ignores unknown fields |
+| 429 / Retry-After live | **Not triggered** on purpose (would burn trial quota) | Covered by mocked tests only |
 
 ## 12. Fixtures
 

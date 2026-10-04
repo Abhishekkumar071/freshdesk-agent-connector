@@ -33,6 +33,7 @@ freshdesk-connector/
 │   ├── errors.py       # ConnectorError hierarchy
 │   ├── client.py       # FreshdeskClient
 │   ├── query.py        # build Freshdesk search query strings from typed filters
+│   ├── statuses.py     # status code ↔ label catalog, loaded from ticket_fields
 │   ├── models.py       # agent-facing Pydantic models
 │   ├── normalize.py    # Freshdesk dict → models
 │   ├── service.py      # TicketService
@@ -123,31 +124,35 @@ for attempt in 1..max_attempts:
 
 Worst case for one tool call: 3 × 10 s timeouts + 2 × ≤10 s waits ≈ 50 s. Typical case: one round trip.
 
-### 3.4 `query.py`
+### 3.4 `query.py` and `statuses.py`
 
-Pure functions that turn typed filters into a Freshdesk query string:
+`query.py` turns typed filters into a Freshdesk query string:
 
 ```python
-build_query(statuses, priorities, tag, ticket_type, created_after, created_before) -> str
+build_query(status_codes, priority_codes, tag, ticket_type, created_after, created_before) -> str
 # e.g. "(status:2 OR status:3) AND (priority:3 OR priority:4) AND tag:'payment'"
 ```
 
 - The agent never writes Freshdesk query syntax. It passes typed fields; we build the string.
 - `tag` / `ticket_type`: 1–64 characters, letters, digits, space, `-`, `_`, `.` only. This rejects quotes and parentheses, so input can't break out of `'...'` or change the query's logic.
-- Dates are formatted as `'YYYY-MM-DD'`. `created_after` ≤ `created_before` is checked.
-- If the result is over 512 characters → `InvalidInput`. This is unlikely with these inputs, but the limit is checked anyway.
+- Dates are formatted as `'YYYY-MM-DD'` and are inclusive. `created_after` ≤ `created_before` is checked.
+- If the result is over 512 characters → `InvalidInput`.
+
+`statuses.py` holds `StatusCatalog`, which is **loaded once at startup** from `GET /ticket_fields` (decision B, after the trial showed custom statuses 6, 7 and 9000 on a fresh account):
+
+- Labels are slugs of the agent-facing names: `open`, `pending`, `resolved`, `closed`, `waiting_on_customer`, ...
+- `unresolved` is a shortcut for **every status except Resolved (4) and Closed (5)**, so custom statuses are included.
+- Unknown labels → `InvalidInput` listing the valid ones. Unknown codes in a ticket → `status_<code>`.
+- If `ticket_fields` can't be loaded (any `ConnectorError`), the catalog falls back to the four built-in statuses with a warning, instead of failing startup.
 
 ### 3.5 `models.py` — agent-facing output
 
 ```python
-Status   = Literal["open", "pending", "resolved", "closed"] | str   # "custom_<code>" for others
-Priority = Literal["low", "medium", "high", "urgent"]
-
 class TicketSummary(BaseModel):
     id: int
     subject: str
-    status: str
-    priority: str
+    status: str                     # catalog label, e.g. "open", "waiting_on_customer"
+    priority: str                   # "low" | "medium" | "high" | "urgent"
     type: str | None
     tags: list[str]
     created_at: datetime
@@ -159,7 +164,7 @@ class TicketSummary(BaseModel):
     url: str                        # https://<domain>/a/tickets/<id> for humans
 
 class Requester(BaseModel):
-    id: int; name: str | None; email: str | None
+    id: int | None; name: str | None; email: str | None
 
 class TicketDetail(TicketSummary):
     source: str                     # "email", "portal", ...
@@ -170,76 +175,59 @@ class TicketDetail(TicketSummary):
     resolved_at: datetime | None
     closed_at: datetime | None
 
-class TicketPage(BaseModel):
+class TicketPage(BaseModel):        # list_tickets
     tickets: list[TicketSummary]
     page: int
     has_more: bool
-    total: int | None               # search only
     notes: list[str]                # plain-language caveats for the agent
 
-class SearchResult(BaseModel):     # one envelope for both search modes
+class SearchResult(BaseModel):     # search_tickets, every mode
     search_mode: Literal["native", "keyword_scan"]
     tickets: list[TicketSummary]
     page: int
     has_more: bool
-    total: int | None               # Freshdesk total for the native filters
+    total: int                      # Freshdesk total for the native filters
     notes: list[str]
-    # keyword_scan only (None in native mode):
-    keyword: str | None
-    max_scan: int | None            # the hard cap, e.g. 90
-    scanned: int | None             # tickets actually examined
-    matched: int | None
-    exhaustive: bool | None         # False → matching tickets may exist beyond the scan
+    keyword: str | None             # keyword_scan only
+    max_scan: int | None            # set when the connector scanned a bounded set (keyword or oldest_first)
+    scanned: int | None             #   "
+    matched: int | None             # keyword_scan only
+    exhaustive: bool | None         #   set with max_scan — False → matches may exist beyond the scan
 ```
 
-`list_tickets` returns `TicketPage`; `search_tickets` always returns `SearchResult`. The agent reads one shape and branches on `search_mode`. When `exhaustive` is `False`, `notes` also contains a plain sentence saying the results are not complete.
+`list_tickets` returns `TicketPage`; `search_tickets` always returns `SearchResult`. The scan fields are filled whenever the result came from a bounded connector-side scan (keyword search, or oldest-first ordering) and are null for plain Freshdesk paging. When `exhaustive` is `False`, `notes` also says so in a plain sentence.
 
-**Deliberately left out:** HTML description, `custom_fields` (merchant-defined, may contain anything, and their schema is unknown to us), CC/BCC emails, conversations, attachments, `spam`/`deleted` flags (spam and deleted tickets are not returned by list or search). Requester name/email is in `get_ticket` only. List and search results carry `requester_id` only, so a bulk listing doesn't copy customer PII into the agent's context.
-
-`notes` exists because the agent can't read our docs. For example: "Only tickets created in the last 30 days are included unless updated_since is set." "Only the 300 most recent matching tickets are reachable; narrow the date range for older ones."
+**Deliberately left out:** HTML description, `custom_fields` (merchant-defined, may contain anything, and their schema is unknown to us), CC/BCC emails, conversations, attachments, `spam`/`deleted` flags. Requester name/email is in `get_ticket` only; the trial showed the requester embed also carries `ip_address`, `first_seen` and `last_seen`, which are dropped. List and search results carry `requester_id` only.
 
 ### 3.6 `normalize.py`
 
-`to_summary(raw, domain)` and `to_detail(raw, domain)`. Code → label maps. HTML is reduced to text with the standard library: prefer `description_text`, otherwise strip tags from `description` with `html.parser` and unescape entities. Missing optional fields become `None`. A missing `id` / `subject` / `status` raises `UnexpectedResponse`. A raw ticket is never passed through to the agent.
+`to_summary(raw, statuses, domain)` and `to_detail(raw, statuses, domain)`. Code → label maps. Description: prefer `description_text`, otherwise strip tags from `description` with `html.parser`. Missing optional fields become `None`. A missing `id` / `status` / `created_at` / `updated_at`, or a bad timestamp, raises `UnexpectedResponse`.
 
 ### 3.7 `service.py` — `TicketService`
 
 ```python
+async def create_ticket_service(client, domain) -> TicketService   # loads StatusCatalog
+
 class TicketService:
-    def __init__(self, client: FreshdeskClient, domain: str): ...
-    async def list_tickets(self, order_by, order, page, page_size, updated_since) -> TicketPage
+    async def list_tickets(self, *, order_by, order, page, page_size, updated_since) -> TicketPage
     async def get_ticket(self, ticket_id) -> TicketDetail
-    async def search_tickets(self, statuses, priorities, tag, ticket_type,
+    async def search_tickets(self, *, status, priority, tag, ticket_type,
                              created_after, created_before, keyword, order, page) -> SearchResult
 ```
 
-`keyword is None` → native mode; otherwise keyword_scan mode.
+Search routes to one of three paths:
 
-**Gate:** the oldest-first optimization below depends on Freshdesk returning search results newest `created_at` first. That is reported by the community but not documented. It will **not** be implemented until it has been checked against a real Freshdesk account (`docs/02` §11). If it can't be checked, or the order turns out different, `order="oldest_first"` falls back to: fetch up to the scan cap, sort locally, and say in `notes` that it is not exhaustive.
+| Path | When | Calls | Ordering |
+|---|---|---|---|
+| Native page | no keyword, `newest_first` | 1 | Freshdesk page `n` (30 per page, pages 1–10), re-sorted newest first within the page |
+| Oldest-first scan | no keyword, `oldest_first` | ≤ 3 | scan ≤ 90 matches, sort by `created_at` ascending **in the connector**, page locally (pages 1–3) |
+| Keyword scan | `keyword` given | ≤ 3 | scan ≤ 90 candidates, match locally, sort per `order`, page locally (pages 1–3) |
 
-**Search, newest first:** `page` n → Freshdesk page n. `has_more = n*30 < min(total, 300)`.
+**Oldest-first (decision A).** The trial could not show which order Freshdesk search uses (docs/02 §11.1), so the connector does not depend on it. It reads up to 3 pages and sorts them itself. If `total` ≤ 90 the answer is exact (`exhaustive=True`). Otherwise `exhaustive=False` and a note tells the agent to narrow with `created_before`/`created_after`. The earlier "fetch the last page" idea is dropped.
 
-**Search, oldest first** (search can't sort; Freshdesk returns newest first per community reports, to be checked on trial):
+**Keyword scan.** Base query = the native filters, or `created_at:>'<today − 365 days>'` when none are given (confirmed accepted on the trial). Match = every word (case-insensitive) appears in subject + plain-text description (the trial confirmed search results include `description_text`). `exhaustive = scanned >= total`. Keyword length is 2–100 characters. There is no stemming or fuzzy matching.
 
-```
-first = search(query, page=1)                  # gives total
-reachable = min(total, 300); last = ceil(reachable / 30)
-target = last - (page - 1); if target < 1 → empty page
-results = first if target == 1 else search(query, page=target)
-return reversed(results)                       # 2 calls normally
-if total > 300: note "oldest tickets beyond the 300 most recent are unreachable — narrow with created_before"
-```
-
-**Keyword search:**
-
-```
-base query = build_query(filters) or created_at:>'<today − 365 days>'   # [check on trial]
-scan pages 1..KEYWORD_SCAN_PAGES (3 → ≤90 tickets, ≤3 calls), stop early if no more
-match: every keyword term (case-insensitive) appears in subject + description text
-exhaustive = scanned >= total
-```
-
-Keyword is 2–100 characters. Matching is plain substring, with no stemming or fuzzy match. If Phase 2's trial check shows search results have no description, matching drops to subject only and a note says so. That code path will exist either way.
+Limits are module constants: `LIST_MAX_PAGE=10`, `LIST_MAX_PAGE_SIZE=50`, `SCAN_MAX_PAGES=3` (→ `SCAN_MAX_TICKETS=90`), `KEYWORD_DEFAULT_LOOKBACK_DAYS=365`.
 
 ### 3.8 `server.py`
 
@@ -281,11 +269,11 @@ Returns `TicketPage`.
 Returns `TicketDetail`. A missing ticket returns a tool error: "Ticket N was not found."
 
 ### `search_tickets`
-> Find tickets by status, priority, tag, type, and creation date. For "unresolved" use `status=["open","pending"]`. Optional `keyword` does a bounded text match on subject/description over at most 90 tickets matching the other filters — results say how many were scanned and whether the scan was complete. Results are capped at the 300 most recent matches.
+> Find tickets by status, priority, tag, type, and creation date. For "unresolved" use `status=["unresolved"]` (all statuses except resolved/closed, including custom ones). Optional `keyword` does a bounded text match on subject/description over at most 90 tickets matching the other filters — results say how many were scanned and whether the scan was complete. Results are capped at the 300 most recent matches.
 
 | Param | Type | Default |
 |---|---|---|
-| `status` | list of `open\|pending\|resolved\|closed` | — |
+| `status` | list of catalog labels, or `unresolved` | — |
 | `priority` | list of `low\|medium\|high\|urgent` | — |
 | `tag` | str, restricted chars | — |
 | `ticket_type` | str, restricted chars | — |
@@ -300,11 +288,11 @@ Mapping of the target questions:
 
 | Question | Call |
 |---|---|
-| Latest unresolved tickets | `search_tickets(status=["open","pending"])` |
+| Latest unresolved tickets | `search_tickets(status=["unresolved"])` |
 | High-priority open tickets | `search_tickets(status=["open"], priority=["high","urgent"])` |
 | Tickets about payment failures | `search_tickets(keyword="payment")` or `search_tickets(tag="payment")` |
 | Ticket 12345 | `get_ticket(12345)` |
-| Oldest unresolved | `search_tickets(status=["open","pending"], order="oldest_first")` |
+| Oldest unresolved | `search_tickets(status=["unresolved"], order="oldest_first")` |
 
 ## 5. Error flow example
 
@@ -351,7 +339,7 @@ log   ← INFO GET /api/v2/tickets/99999 status=404 attempt=1 ms=180
 | Data types | raw dicts end-to-end · Pydantic models | **Raw dicts inside client, Pydantic at the service boundary** | Modelling all ~30 Freshdesk fields adds no value. The output models are the contract that matters |
 | Search input | Agent writes raw Freshdesk query · typed filters | **Typed filters** | LLMs get the quoting, case-sensitivity and numeric codes wrong, and a raw string is an injection surface. Cost: fewer combinations (e.g. no OR across different fields) |
 | Free text | none · fetch everything · bounded scan | **Bounded scan (≤90)** | Phase 1 decision. Honest `scanned`/`exhaustive` output |
-| Unresolved | Open+Pending · read custom statuses from `ticket_fields` | **Open+Pending** | One less API call and one less moving part. Custom statuses show as `custom_<n>` |
+| Unresolved | Open+Pending · read custom statuses from `ticket_fields` | **Read `ticket_fields` at startup** (changed after trial check) | A fresh trial already has 3 custom statuses; Open+Pending would miss them. Costs 1 call per server start |
 | Test async plugin | pytest-asyncio · anyio pytest plugin | **anyio plugin** | anyio is already installed with `mcp`/`httpx`, and the MCP testing docs use it. One fewer dependency, same capability |
 | Storage / cache | none · cache tickets | **None** | Data must be current; volume is small; a cache adds invalidation bugs and holds PII |
 
@@ -367,7 +355,7 @@ Options were (A) an optional `keyword` on `search_tickets`, or (B) a fourth tool
 | 4 | `test_client.py` | 200 list/get/search, Link header, 400 (field message), 401, 403, 404, 405, 429 with/without Retry-After, Retry-After over cap → fail fast, 500→200 recovery, 503 exhausted, timeout, connect error, bad JSON, no retry on 4xx, auth header present, key absent from errors/logs, GET-only |
 | 5 | `test_query.py` | each filter, combos, quoting, rejected chars, date order, 512 limit |
 | 5 | `test_normalize.py` | fixtures → models, label maps, custom status, HTML stripping, truncation, missing fields |
-| 5 | `test_service.py` | pagination math, oldest-first (`total` 0 / 25 / 95 / 450), keyword scan bounds and `exhaustive`, notes |
+| 5 | `test_service.py` | pagination math, oldest-first exact vs. bounded (scrambled server order), keyword scan bounds and `exhaustive`, notes, status catalog fallback |
 | 6 | `test_server.py` | exactly the expected read-only tools and annotations, schemas, invalid args rejected, ConnectorError → `is_error` with a safe message, unexpected error masked |
 
 Dependencies: runtime `mcp>=2.3,<3`, `httpx`, `pydantic`, `pydantic-settings`. Dev: `pytest`, `respx`, `pytest-cov`. Managed with `uv`.
