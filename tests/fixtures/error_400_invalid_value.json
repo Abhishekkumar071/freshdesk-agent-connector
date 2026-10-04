@@ -1,0 +1,6 @@
+{
+  "description": "Validation failed",
+  "errors": [
+    {"field": "status", "message": "It should be one of these values: '2,3,4,5'", "code": "invalid_value"}
+  ]
+}
