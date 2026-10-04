@@ -5,12 +5,21 @@ limits, and normalizes results. Has no HTTP or MCP code of its own.
 """
 
 import logging
+import time as clock
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
 from .client import FreshdeskClient
-from .errors import ConnectorError, InvalidInput
+from .errors import (
+    ConnectorError,
+    InvalidInput,
+    NetworkError,
+    RateLimited,
+    RequestTimeout,
+    ServiceUnavailable,
+)
 from .models import SearchResult, TicketDetail, TicketPage, TicketSummary
 from .normalize import PRIORITY_CODES, plain_text, to_detail, to_summary
 from .query import build_query
@@ -27,24 +36,42 @@ SEARCH_MAX_PAGE = 10  # Freshdesk rejects page > 10
 SEARCH_MAX_REACHABLE = SEARCH_PAGE_SIZE * SEARCH_MAX_PAGE  # 300
 SCAN_MAX_PAGES = 3  # bounded connector-side scans: keyword and oldest-first
 SCAN_MAX_TICKETS = SCAN_MAX_PAGES * SEARCH_PAGE_SIZE  # 90
+# Don't start another scan page after this long, so one tool call can't run for minutes.
+SCAN_TIME_BUDGET_SECONDS = 15.0
 KEYWORD_MIN_CHARS = 2
 KEYWORD_MAX_CHARS = 100
 KEYWORD_DEFAULT_LOOKBACK_DAYS = 365
+# If the account's statuses couldn't be loaded, try again at most this often.
+STATUS_RELOAD_INTERVAL_SECONDS = 60.0
+
+# Failures worth stopping a scan for (keeping what was read) instead of failing the call.
+TRANSIENT_ERRORS = (RateLimited, ServiceUnavailable, RequestTimeout, NetworkError)
 
 NOTE_LIST_30_DAYS = (
     "Freshdesk only lists tickets created in the last 30 days unless updated_since is set."
 )
+NOTE_BUILTIN_STATUSES = (
+    "The account's custom ticket statuses could not be loaded, so only open, pending, "
+    "resolved and closed are recognised and 'unresolved' means open or pending."
+)
 
 
 async def create_ticket_service(client: FreshdeskClient, domain: str) -> "TicketService":
-    """Load the account's status names, then build the service. If the statuses
-    can't be loaded, fall back to the four built-in ones rather than fail startup."""
-    try:
-        statuses = StatusCatalog.from_ticket_fields(await client.list_ticket_fields())
-    except ConnectorError as exc:
-        logger.warning("Could not load ticket statuses (%s); using built-in statuses", type(exc).__name__)
-        statuses = StatusCatalog.default()
-    return TicketService(client, domain, statuses)
+    """Build the service and load the account's status names. If that fails, the
+    service starts with the four built-in statuses and retries later."""
+    service = TicketService(client, domain, StatusCatalog.default(), statuses_loaded=False)
+    await service.load_statuses()
+    return service
+
+
+@dataclass(frozen=True)
+class _Scan:
+    tickets: list[dict[str, Any]]
+    total: int
+    stopped_because: str | None  # why the scan ended early, if it did
+
+    def exhaustive(self) -> bool:
+        return self.stopped_because is None and len(self.tickets) >= self.total
 
 
 class TicketService:
@@ -54,15 +81,33 @@ class TicketService:
         domain: str,
         statuses: StatusCatalog,
         today: Callable[[], date] = lambda: datetime.now(UTC).date(),
+        *,
+        statuses_loaded: bool = True,
+        monotonic: Callable[[], float] = clock.monotonic,
     ) -> None:
         self._client = client
         self._domain = domain
         self._statuses = statuses
+        self._statuses_loaded = statuses_loaded
+        self._last_status_attempt: float | None = None
         self._today = today
+        self._monotonic = monotonic
 
     @property
     def statuses(self) -> StatusCatalog:
         return self._statuses
+
+    async def load_statuses(self) -> None:
+        """Read the account's status names. On failure keep the current catalog."""
+        self._last_status_attempt = self._monotonic()
+        try:
+            fields = await self._client.list_ticket_fields()
+        except ConnectorError as exc:
+            logger.warning("Could not load ticket statuses (%s); using built-in statuses",
+                           type(exc).__name__)
+            return
+        self._statuses = StatusCatalog.from_ticket_fields(fields)
+        self._statuses_loaded = True
 
     async def list_tickets(
         self,
@@ -77,6 +122,7 @@ class TicketService:
         _require_choice("order", order, ("newest_first", "oldest_first"))
         _require_range("page", page, 1, LIST_MAX_PAGE)
         _require_range("page_size", page_size, 1, LIST_MAX_PAGE_SIZE)
+        await self._retry_statuses_if_needed()
 
         since = datetime.combine(updated_since, time.min, UTC) if updated_since else None
         result = await self._client.list_tickets(
@@ -87,7 +133,9 @@ class TicketService:
             updated_since=since,
         )
 
-        notes = [] if updated_since else [NOTE_LIST_30_DAYS]
+        notes = self._base_notes()
+        if not updated_since:
+            notes.append(NOTE_LIST_30_DAYS)
         if result.has_next and page == LIST_MAX_PAGE:
             notes.append(
                 f"This is the last page the connector returns (page {LIST_MAX_PAGE}). "
@@ -103,6 +151,7 @@ class TicketService:
     async def get_ticket(self, ticket_id: int) -> TicketDetail:
         if isinstance(ticket_id, bool) or not isinstance(ticket_id, int) or ticket_id < 1:
             raise InvalidInput("ticket_id must be a positive integer.")
+        await self._retry_statuses_if_needed()
         raw = await self._client.get_ticket(ticket_id, include=("requester", "stats"))
         return to_detail(raw, self._statuses, self._domain)
 
@@ -123,6 +172,7 @@ class TicketService:
         # A bare string would otherwise be iterated character by character.
         status = [status] if isinstance(status, str) else status
         priority = [priority] if isinstance(priority, str) else priority
+        await self._retry_statuses_if_needed()
         query = build_query(
             status_codes=self._statuses.codes_for(status),
             priority_codes=_priority_codes(priority),
@@ -148,7 +198,7 @@ class TicketService:
         _require_range("page", page, 1, SEARCH_MAX_PAGE)
         result = await self._client.search_tickets(query, page=page)
 
-        notes = []
+        notes = self._base_notes()
         if result.total > SEARCH_MAX_REACHABLE:
             notes.append(
                 f"{result.total} tickets match, but Freshdesk search only returns the first "
@@ -166,27 +216,25 @@ class TicketService:
     async def _oldest_first(self, query: str, page: int) -> SearchResult:
         """Freshdesk search can't sort, so scan up to SCAN_MAX_TICKETS and sort here."""
         _require_range("page", page, 1, SCAN_MAX_PAGES, when="when order is oldest_first")
-        raw, total = await self._scan(query)
-        tickets = sorted(self._summaries(raw), key=lambda t: (t.created_at, t.id))
-        exhaustive = len(raw) >= total
+        scan = await self._scan(query)
+        tickets = sorted(self._summaries(scan.tickets), key=lambda t: (t.created_at, t.id))
 
-        notes = []
-        if not exhaustive:
+        notes = self._base_notes()
+        if not scan.exhaustive():
             notes.append(
-                f"Not exhaustive: {total} tickets match but only {len(raw)} were scanned "
-                f"(limit {SCAN_MAX_TICKETS}), so older matching tickets may exist. "
-                "Narrow with created_before/created_after for an exact answer."
+                _not_exhaustive_note(scan, "older matching tickets may exist")
+                + " Narrow with created_before/created_after for an exact answer."
             )
         return SearchResult(
             search_mode="native",
             tickets=_page_of(tickets, page),
             page=page,
             has_more=page * SEARCH_PAGE_SIZE < len(tickets),
-            total=total,
+            total=scan.total,
             notes=notes,
             max_scan=SCAN_MAX_TICKETS,
-            scanned=len(raw),
-            exhaustive=exhaustive,
+            scanned=len(scan.tickets),
+            exhaustive=scan.exhaustive(),
         )
 
     async def _keyword_scan(self, query: str, keyword: str, order: Order, page: int) -> SearchResult:
@@ -198,7 +246,7 @@ class TicketService:
             )
         _require_range("page", page, 1, SCAN_MAX_PAGES, when="when a keyword is given")
 
-        notes = []
+        notes = self._base_notes()
         if not query:
             since = self._today() - timedelta(days=KEYWORD_DEFAULT_LOOKBACK_DAYS)
             query = build_query(created_after=since)
@@ -207,21 +255,19 @@ class TicketService:
                 f"{KEYWORD_DEFAULT_LOOKBACK_DAYS} days."
             )
 
-        raw, total = await self._scan(query)
+        scan = await self._scan(query)
         terms = keyword.lower().split()
-        matches = [t for t in raw if _matches(t, terms)]
+        matches = [t for t in scan.tickets if _matches(t, terms)]
         summaries = self._summaries(matches)
         if order == "oldest_first":
             summaries.sort(key=lambda t: (t.created_at, t.id))
         else:
             summaries = _newest_first(summaries)
 
-        exhaustive = len(raw) >= total
-        if not exhaustive:
+        if not scan.exhaustive():
             notes.append(
-                f"Not exhaustive: only {len(raw)} of {total} candidate tickets were scanned "
-                f"(limit {SCAN_MAX_TICKETS}), so more matching tickets may exist. "
-                "Add filters such as status or a date range to narrow the candidates."
+                _not_exhaustive_note(scan, "more matching tickets may exist")
+                + " Add filters such as status or a date range to narrow the candidates."
             )
         notes.append(
             "Keyword matching is a case-insensitive text match on subject and description; "
@@ -232,29 +278,72 @@ class TicketService:
             tickets=_page_of(summaries, page),
             page=page,
             has_more=page * SEARCH_PAGE_SIZE < len(summaries),
-            total=total,
+            total=scan.total,
             notes=notes,
             keyword=keyword,
             max_scan=SCAN_MAX_TICKETS,
-            scanned=len(raw),
+            scanned=len(scan.tickets),
             matched=len(matches),
-            exhaustive=exhaustive,
+            exhaustive=scan.exhaustive(),
         )
 
-    async def _scan(self, query: str) -> tuple[list[dict[str, Any]], int]:
-        """Fetch search pages until all matches are read or SCAN_MAX_PAGES is reached."""
-        collected: list[dict[str, Any]] = []
+    async def _scan(self, query: str) -> _Scan:
+        """Read search pages until every match is read, SCAN_MAX_PAGES is reached,
+        the time budget runs out, or a later page fails transiently.
+
+        A failure on page 1 is raised: there is nothing useful to return yet.
+        """
+        started = self._monotonic()
+        by_id: dict[Any, dict[str, Any]] = {}  # tickets can shift between pages; keep one copy
         total = 0
         for page in range(1, SCAN_MAX_PAGES + 1):
-            result = await self._client.search_tickets(query, page=page)
-            collected.extend(result.tickets)
+            if page > 1 and self._monotonic() - started >= SCAN_TIME_BUDGET_SECONDS:
+                return _Scan(list(by_id.values()), total, "the time limit for one request was reached")
+            try:
+                result = await self._client.search_tickets(query, page=page)
+            except TRANSIENT_ERRORS as exc:
+                if page == 1:
+                    raise
+                logger.warning("Scan stopped at page %d: %s", page, type(exc).__name__)
+                return _Scan(list(by_id.values()), total, _reason(exc))
+            for ticket in result.tickets:
+                by_id.setdefault(ticket.get("id"), ticket)
             total = result.total
-            if len(collected) >= total or len(result.tickets) < SEARCH_PAGE_SIZE:
+            if len(by_id) >= total or len(result.tickets) < SEARCH_PAGE_SIZE:
                 break
-        return collected, total
+        return _Scan(list(by_id.values()), total, None)
+
+    async def _retry_statuses_if_needed(self) -> None:
+        if self._statuses_loaded:
+            return
+        last = self._last_status_attempt
+        if last is None or self._monotonic() - last >= STATUS_RELOAD_INTERVAL_SECONDS:
+            await self.load_statuses()
+
+    def _base_notes(self) -> list[str]:
+        return [] if self._statuses_loaded else [NOTE_BUILTIN_STATUSES]
 
     def _summaries(self, raw_tickets: list[dict[str, Any]]) -> list[TicketSummary]:
         return [to_summary(raw, self._statuses, self._domain) for raw in raw_tickets]
+
+
+def _reason(exc: ConnectorError) -> str:
+    if isinstance(exc, RateLimited):
+        return "Freshdesk's rate limit was reached"
+    if isinstance(exc, ServiceUnavailable):
+        return "Freshdesk was temporarily unavailable"
+    if isinstance(exc, RequestTimeout):
+        return "a request to Freshdesk timed out"
+    return "Freshdesk could not be reached"
+
+
+def _not_exhaustive_note(scan: _Scan, consequence: str) -> str:
+    scanned = len(scan.tickets)
+    if scan.stopped_because:
+        return (f"Not exhaustive: the scan stopped after {scanned} of {scan.total} tickets "
+                f"because {scan.stopped_because}, so {consequence}.")
+    return (f"Not exhaustive: {scan.total} tickets match but only {scanned} were scanned "
+            f"(limit {SCAN_MAX_TICKETS}), so {consequence}.")
 
 
 def _priority_codes(labels: Sequence[str]) -> list[int]:

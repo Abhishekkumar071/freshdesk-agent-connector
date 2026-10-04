@@ -5,6 +5,7 @@ translate ConnectorError into ToolError. There is no Freshdesk or HTTP logic her
 """
 
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import date
@@ -99,7 +100,7 @@ def create_server(service_factory: ServiceFactory) -> MCPServer:
         Freshdesk only lists tickets created in the last 30 days unless
         updated_since is given. Returns ticket summaries; use get_ticket for details.
         """
-        return await _call(ctx, lambda s: s.list_tickets(
+        return await _call(ctx, "list_tickets", lambda s: s.list_tickets(
             order_by=order_by, order=order, page=page, page_size=page_size,
             updated_since=updated_since,
         ))
@@ -116,7 +117,7 @@ def create_server(service_factory: ServiceFactory) -> MCPServer:
         requester name and email, and first-response / resolved / closed times.
         Does not include the conversation thread or attachments.
         """
-        return await _call(ctx, lambda s: s.get_ticket(ticket_id))
+        return await _call(ctx, "get_ticket", lambda s: s.get_ticket(ticket_id))
 
     @mcp.tool(annotations=READ_ONLY, description=SEARCH_TICKETS_DESCRIPTION)
     async def search_tickets(
@@ -146,7 +147,7 @@ def create_server(service_factory: ServiceFactory) -> MCPServer:
         order: Order = "newest_first",
         page: Annotated[int, Field(ge=1, le=SEARCH_MAX_PAGE)] = 1,
     ) -> SearchResult:
-        return await _call(ctx, lambda s: s.search_tickets(
+        return await _call(ctx, "search_tickets", lambda s: s.search_tickets(
             status=status or (), priority=priority or (), tag=tag, ticket_type=ticket_type,
             created_after=created_after, created_before=created_before,
             keyword=keyword, order=order, page=page,
@@ -155,11 +156,24 @@ def create_server(service_factory: ServiceFactory) -> MCPServer:
     return mcp
 
 
-async def _call(ctx: Context[TicketService], operation: Callable[[TicketService], Awaitable[T]]) -> T:
-    """Run a service operation; turn expected failures into agent-readable tool errors."""
+async def _call(
+    ctx: Context[TicketService], tool: str, operation: Callable[[TicketService], Awaitable[T]]
+) -> T:
+    """Run a service operation; turn expected failures into agent-readable tool errors.
+
+    Logs one line per call with the outcome and duration. Arguments and results are
+    not logged: they can contain customer data.
+    """
     service = ctx.request_context.lifespan_context
+    started = time.monotonic()
+    outcome = "unexpected_error"  # overwritten unless an unexpected exception escapes
     try:
-        return await operation(service)
+        result = await operation(service)
+        outcome = "ok"
+        return result
     except ConnectorError as exc:
-        logger.info("Tool call failed: %s", type(exc).__name__)
+        outcome = type(exc).__name__
         raise ToolError(exc.message) from exc
+    finally:
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.info("tool=%s outcome=%s ms=%d", tool, outcome, elapsed_ms)

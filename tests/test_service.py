@@ -5,8 +5,18 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from freshdesk_connector.client import TicketListPage, TicketSearchPage
-from freshdesk_connector.errors import AuthenticationFailed, InvalidInput, NotFound
+from freshdesk_connector.errors import (
+    AuthenticationFailed,
+    InvalidInput,
+    InvalidRequest,
+    NetworkError,
+    NotFound,
+    RateLimited,
+    RequestTimeout,
+    ServiceUnavailable,
+)
 from freshdesk_connector.service import (
+    NOTE_BUILTIN_STATUSES,
     NOTE_LIST_30_DAYS,
     SCAN_MAX_TICKETS,
     TicketService,
@@ -38,13 +48,15 @@ class FakeClient:
     """Records calls. Search serves `search_results` 30 per page, in the given order."""
 
     def __init__(self, *, list_page=None, ticket=None, search_results=(), total=None,
-                 fields=None, error=None):
+                 fields=None, error=None, page_errors=None, on_search=None):
         self.list_page = list_page or TicketListPage(tickets=[], has_next=False)
         self.ticket = ticket
         self.search_results = list(search_results)
         self.total = len(self.search_results) if total is None else total
         self.fields = fields
         self.error = error
+        self.page_errors = page_errors or {}  # search page number -> exception to raise
+        self.on_search = on_search  # called before each search, e.g. to advance a fake clock
         self.calls: list[tuple] = []
 
     async def list_tickets(self, **kwargs):
@@ -59,6 +71,10 @@ class FakeClient:
 
     async def search_tickets(self, query, page=1):
         self.calls.append(("search", query, page))
+        if self.on_search:
+            self.on_search()
+        if page in self.page_errors:
+            raise self.page_errors[page]
         start = (page - 1) * 30
         return TicketSearchPage(tickets=self.search_results[start:start + 30], total=self.total)
 
@@ -360,3 +376,138 @@ async def test_keyword_no_matches():
     client = FakeClient(search_results=[raw_ticket(1, subject="hello")])
     result = await make_service(client).search_tickets(status=["open"], keyword="refund")
     assert result.tickets == [] and result.matched == 0 and result.exhaustive is True
+
+
+# --- reliability: partial scans, time budget, duplicates --------------------------------
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (RateLimited("limit", retry_after=30), "rate limit was reached"),
+        (ServiceUnavailable("down"), "temporarily unavailable"),
+        (RequestTimeout("slow"), "timed out"),
+        (NetworkError("unreachable"), "could not be reached"),
+    ],
+)
+async def test_scan_keeps_earlier_pages_when_a_later_page_fails(error, reason):
+    client = FakeClient(search_results=[raw_ticket(i) for i in range(1, 91)], page_errors={2: error})
+
+    result = await make_service(client).search_tickets(status=["open"], order="oldest_first")
+
+    assert result.scanned == 30 and result.total == 90
+    assert [t.id for t in result.tickets][:2] == [1, 2]
+    assert result.exhaustive is False
+    assert result.notes[0].startswith("Not exhaustive: the scan stopped after 30 of 90 tickets")
+    assert reason in result.notes[0]
+
+
+async def test_keyword_scan_also_returns_partial_results():
+    tickets = [raw_ticket(i, subject="refund") for i in range(1, 91)]
+    client = FakeClient(search_results=tickets, page_errors={3: RateLimited("limit")})
+
+    result = await make_service(client).search_tickets(status=["open"], keyword="refund")
+
+    assert (result.scanned, result.matched, result.exhaustive) == (60, 60, False)
+    assert "rate limit" in result.notes[0]
+
+
+async def test_scan_raises_when_first_page_fails():
+    client = FakeClient(search_results=[raw_ticket(1)], page_errors={1: RateLimited("limit")})
+    with pytest.raises(RateLimited):
+        await make_service(client).search_tickets(status=["open"], order="oldest_first")
+
+
+async def test_scan_raises_permanent_errors_on_later_pages():
+    client = FakeClient(search_results=[raw_ticket(i) for i in range(1, 91)],
+                        page_errors={2: InvalidRequest("bad")})
+    with pytest.raises(InvalidRequest):
+        await make_service(client).search_tickets(status=["open"], keyword="subject")
+
+
+async def test_scan_stops_at_time_budget():
+    fake_clock = FakeClock()
+
+    def slow_page():
+        fake_clock.now += 10  # each page "takes" 10 seconds
+
+    client = FakeClient(search_results=[raw_ticket(i) for i in range(1, 91)], on_search=slow_page)
+    service = TicketService(client, DOMAIN, STATUSES, today=lambda: TODAY, monotonic=fake_clock)
+
+    result = await service.search_tickets(status=["open"], order="oldest_first")
+
+    assert len(client.search_calls) == 2  # page 3 not started: 20s used > 15s budget
+    assert result.scanned == 60 and result.exhaustive is False
+    assert "time limit" in result.notes[0]
+
+
+async def test_scan_deduplicates_tickets_that_shift_between_pages():
+    page1 = [raw_ticket(i) for i in range(60, 30, -1)]  # ids 60..31
+    page2 = [raw_ticket(31)] + [raw_ticket(i) for i in range(30, 1, -1)]  # 31 again, then 30..2
+    client = FakeClient(search_results=page1 + page2 + [raw_ticket(1)], total=60)
+    service = make_service(client)
+
+    first = await service.search_tickets(status=["open"], order="oldest_first")
+    second = await service.search_tickets(status=["open"], order="oldest_first", page=2)
+
+    ids = [t.id for t in first.tickets + second.tickets]
+    assert len(ids) == len(set(ids)) == 60
+    assert first.scanned == 60 and first.exhaustive is True
+
+
+# --- reliability: status catalog recovery --------------------------------------------------
+
+CUSTOM_FIELDS = [{"name": "status", "choices": {"2": ["Open", "Open"], "3": ["Pending", "Pending"],
+                                                "6": ["Waiting on Customer", "x"]}}]
+
+
+def fields_calls(client: FakeClient) -> int:
+    return sum(c[0] == "fields" for c in client.calls)
+
+
+async def test_failed_status_load_is_retried_later_and_noted_meanwhile():
+    fake_clock = FakeClock()
+    client = FakeClient(search_results=[raw_ticket(1, status=6)], fields=CUSTOM_FIELDS,
+                        error=ServiceUnavailable("down"))
+    service = TicketService(client, DOMAIN, StatusCatalog.default(), today=lambda: TODAY,
+                            statuses_loaded=False, monotonic=fake_clock)
+    await service.load_statuses()  # startup attempt fails
+
+    degraded = await service.search_tickets(status=["unresolved"])
+    assert degraded.notes[0] == NOTE_BUILTIN_STATUSES
+    assert degraded.tickets[0].status == "status_6"
+    assert client.search_calls[-1][1] == "(status:2 OR status:3)"
+    assert fields_calls(client) == 1  # too soon to retry
+
+    client.error = None  # Freshdesk recovers
+    fake_clock.now += 61
+    recovered = await service.search_tickets(status=["unresolved"])
+
+    assert fields_calls(client) == 2
+    assert recovered.notes == []
+    assert recovered.tickets[0].status == "waiting_on_customer"
+    assert client.search_calls[-1][1] == "(status:2 OR status:3 OR status:6)"
+
+    fake_clock.now += 600
+    await service.search_tickets(status=["open"])
+    assert fields_calls(client) == 2  # loaded once; never reloaded
+
+
+async def test_list_and_get_load_statuses_on_first_use():
+    client = FakeClient(ticket=raw_ticket(1, status=6) | {"source": 1}, fields=CUSTOM_FIELDS)
+    service = TicketService(client, DOMAIN, StatusCatalog.default(), statuses_loaded=False)
+
+    page = await service.list_tickets()
+    ticket = await service.get_ticket(1)
+
+    assert page.notes == [NOTE_LIST_30_DAYS]
+    assert ticket.status == "waiting_on_customer"
+    assert fields_calls(client) == 1

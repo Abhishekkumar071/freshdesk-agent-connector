@@ -227,7 +227,15 @@ Search routes to one of three paths:
 
 **Keyword scan.** Base query = the native filters, or `created_at:>'<today − 365 days>'` when none are given (confirmed accepted on the trial). Match = every word (case-insensitive) appears in subject + plain-text description (the trial confirmed search results include `description_text`). `exhaustive = scanned >= total`. Keyword length is 2–100 characters. There is no stemming or fuzzy matching.
 
-Limits are module constants: `LIST_MAX_PAGE=10`, `LIST_MAX_PAGE_SIZE=50`, `SCAN_MAX_PAGES=3` (→ `SCAN_MAX_TICKETS=90`), `KEYWORD_DEFAULT_LOOKBACK_DAYS=365`.
+Limits are module constants: `LIST_MAX_PAGE=10`, `LIST_MAX_PAGE_SIZE=50`, `SCAN_MAX_PAGES=3` (→ `SCAN_MAX_TICKETS=90`), `SCAN_TIME_BUDGET_SECONDS=15`, `KEYWORD_DEFAULT_LOOKBACK_DAYS=365`, `STATUS_RELOAD_INTERVAL_SECONDS=60`.
+
+**Scan resilience (Phase 7).** A scan returns what it has, with `exhaustive=False` and a note giving the reason, when:
+- page 2 or 3 fails with a temporary error (`RateLimited`, `ServiceUnavailable`, `RequestTimeout`, `NetworkError`), or
+- 15 s have passed before the next page would start.
+
+Permanent errors, and any failure on page 1, are still raised. Tickets are de-duplicated by ID across pages, in case data shifts between requests.
+
+**Status catalog recovery (Phase 7).** If `ticket_fields` fails at startup, the service uses the built-in statuses and retries on a later tool call, at most once per 60 s. Until it succeeds, every list and search result carries a note saying custom statuses aren't recognised.
 
 ### 3.8 `server.py`
 
@@ -311,7 +319,8 @@ log   ← INFO GET /api/v2/tickets/99999 status=404 attempt=1 ms=180
 - Standard `logging`, to **stderr**. With the stdio transport, stdout carries the protocol, so writing logs there would corrupt it.
 - One line per HTTP attempt: method, path, status, attempt, duration, `X-RateLimit-Remaining`. WARNING on retry and when remaining quota drops below 10% of `X-RateLimit-Total`.
 - Never logged: the API key, the `Authorization` header, response bodies, ticket descriptions, requester email.
-- A test captures logs during a failing call and asserts the key string is absent.
+- One INFO line per tool call: `tool=<name> outcome=<ok|ErrorType|unexpected_error> ms=<n>`. Arguments and results are not logged.
+- A test captures logs during a failing call and asserts the key string is absent. In Phase 7 a live run at DEBUG level (including httpx/httpcore internals) was scanned for the key, the base64 credentials and any `Authorization` header: none were present.
 
 ## 7. Security summary
 

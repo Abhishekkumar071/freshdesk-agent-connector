@@ -5,6 +5,7 @@ the real service and client against mocked HTTP, end to end.
 """
 
 import json
+import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 
@@ -238,6 +239,23 @@ async def test_service_is_opened_once_and_closed(service):
         await c.call_tool("get_ticket", {"ticket_id": 1})
         assert events == ["open"]
     assert events == ["open", "close"]
+
+
+async def test_each_tool_call_logs_outcome_without_arguments(caplog):
+    service = FakeService()
+    with caplog.at_level(logging.INFO, logger="freshdesk_connector"):
+        async with Client(create_server(factory_for(service))) as c:
+            await c.call_tool("search_tickets", {"keyword": "secret-customer-words"})
+            service.error = NotFound("Ticket 5 was not found.")
+            await c.call_tool("get_ticket", {"ticket_id": 5})
+            service.error = RuntimeError("boom")
+            await c.call_tool("list_tickets", {})
+
+    lines = [r.getMessage() for r in caplog.records if r.name == "freshdesk_connector.server"]
+    assert lines[0].startswith("tool=search_tickets outcome=ok ms=")
+    assert lines[1].startswith("tool=get_ticket outcome=NotFound ms=")
+    assert lines[2].startswith("tool=list_tickets outcome=unexpected_error ms=")
+    assert "secret-customer-words" not in caplog.text
 
 
 # --- end to end: MCP → service → client → mocked Freshdesk ------------------------------
