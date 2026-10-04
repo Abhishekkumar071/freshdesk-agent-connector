@@ -302,7 +302,7 @@ server → service.get_ticket(99999) → client._get("/tickets/99999")
 Freshdesk → 404
 client → raise NotFound("Ticket 99999 was not found.")       # no retry
 server → raise ToolError("Ticket 99999 was not found.")
-agent ← is_error=True, content="Ticket 99999 was not found."
+agent ← is_error=True, content="Error executing tool get_ticket: Ticket 99999 was not found."   # prefix added by the MCP SDK
 log   ← INFO GET /api/v2/tickets/99999 status=404 attempt=1 ms=180
 ```
 
