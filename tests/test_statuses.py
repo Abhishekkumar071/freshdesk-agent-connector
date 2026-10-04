@@ -3,7 +3,7 @@ import pytest
 from freshdesk_connector.errors import InvalidInput
 from freshdesk_connector.statuses import StatusCatalog, slugify
 
-# Shape observed on the trial account (docs/02 §11.1).
+# Shape observed on a Freshdesk trial account (docs/freshdesk-api-notes.md).
 TRIAL_FIELDS = [
     {"name": "requester", "choices": {}},
     {

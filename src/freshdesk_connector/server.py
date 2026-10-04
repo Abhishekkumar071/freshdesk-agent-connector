@@ -47,6 +47,23 @@ INSTRUCTIONS = (
     "Always check a result's `notes`, and when `exhaustive` is false, tell the user the answer may be incomplete."
 )
 
+# Tool descriptions are what the agent reads to pick a tool, so they live here as
+# plain text rather than as indented docstrings.
+
+LIST_TICKETS_DESCRIPTION = """List recent Freshdesk tickets, newest first by default.
+
+Use for "latest" or "recent" tickets when no status or priority filter is
+needed. It cannot filter by status or priority; use search_tickets for that.
+Freshdesk only lists tickets created in the last 30 days unless
+updated_since is given. Returns ticket summaries; use get_ticket for details."""
+
+GET_TICKET_DESCRIPTION = """Get full details of one Freshdesk ticket by its ID.
+
+Use when the user names a specific ticket or you need more than a summary.
+Includes the plain-text description (truncated at 2,000 characters),
+requester name and email, and first-response / resolved / closed times.
+Does not include the conversation thread or attachments."""
+
 SEARCH_TICKETS_DESCRIPTION = f"""Search Freshdesk tickets by status, priority, tag, type and creation date.
 
 Use for questions like "unresolved tickets", "high-priority open tickets" or
@@ -55,18 +72,13 @@ Use for questions like "unresolved tickets", "high-priority open tickets" or
 Freshdesk cannot search text, so `keyword` is matched by this connector over at
 most {SCAN_MAX_TICKETS} tickets that match the other filters (search_mode
 "keyword_scan"). order="oldest_first" also sorts at most {SCAN_MAX_TICKETS}
-tickets in the connector. With a keyword or oldest_first, only pages 1-3 exist. In both cases `scanned`
-and `exhaustive` are set: if `exhaustive` is false, more matching tickets may
-exist, so tell the user, or follow the note's suggestion (usually created_before)
-to continue the search.
+tickets in the connector. With a keyword or oldest_first, only pages 1-3 exist.
+In both cases `scanned` and `exhaustive` are set: if `exhaustive` is false, more
+matching tickets may exist, so tell the user, or follow the note's suggestion
+(usually created_before) to continue the search.
 
 If the account tags or types its tickets (for example tag "payment"), filtering by
 `tag` or `ticket_type` is complete and cheaper than a keyword scan."""
-
-Order = Annotated[
-    Literal["newest_first", "oldest_first"],
-    Field(description="Sort direction."),
-]
 
 
 def create_server(service_factory: ServiceFactory) -> MCPServer:
@@ -80,14 +92,17 @@ def create_server(service_factory: ServiceFactory) -> MCPServer:
 
     mcp = MCPServer("freshdesk-tickets", instructions=INSTRUCTIONS, lifespan=lifespan)
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(annotations=READ_ONLY, description=LIST_TICKETS_DESCRIPTION)
     async def list_tickets(
         ctx: Context[TicketService],
         order_by: Annotated[
             Literal["created_at", "updated_at"],
             Field(description="Timestamp to sort by."),
         ] = "created_at",
-        order: Order = "newest_first",
+        order: Annotated[
+            Literal["newest_first", "oldest_first"],
+            Field(description="Sort direction."),
+        ] = "newest_first",
         page: Annotated[int, Field(ge=1, le=LIST_MAX_PAGE)] = 1,
         page_size: Annotated[int, Field(ge=1, le=LIST_MAX_PAGE_SIZE)] = 20,
         updated_since: Annotated[
@@ -96,30 +111,16 @@ def create_server(service_factory: ServiceFactory) -> MCPServer:
                               "Also lifts Freshdesk's 30-day default window."),
         ] = None,
     ) -> TicketPage:
-        """List recent Freshdesk tickets, newest first by default.
-
-        Use for "latest" or "recent" tickets when no status or priority filter is
-        needed. It cannot filter by status or priority; use search_tickets for that.
-        Freshdesk only lists tickets created in the last 30 days unless
-        updated_since is given. Returns ticket summaries; use get_ticket for details.
-        """
         return await _call(ctx, "list_tickets", lambda s: s.list_tickets(
             order_by=order_by, order=order, page=page, page_size=page_size,
             updated_since=updated_since,
         ))
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(annotations=READ_ONLY, description=GET_TICKET_DESCRIPTION)
     async def get_ticket(
         ctx: Context[TicketService],
         ticket_id: Annotated[int, Field(ge=1, description="Numeric Freshdesk ticket ID, e.g. 12345.")],
     ) -> TicketDetail:
-        """Get full details of one Freshdesk ticket by its ID.
-
-        Use when the user names a specific ticket or you need more than a summary.
-        Includes the plain-text description (truncated at 2,000 characters),
-        requester name and email, and first-response / resolved / closed times.
-        Does not include the conversation thread or attachments.
-        """
         return await _call(ctx, "get_ticket", lambda s: s.get_ticket(ticket_id))
 
     @mcp.tool(annotations=READ_ONLY, description=SEARCH_TICKETS_DESCRIPTION)

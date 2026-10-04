@@ -1,73 +1,126 @@
-# Demo — agent end-to-end validation (Phase 9)
+# Running the demo
 
-How to reproduce the demo, and what was observed on 2026-10-04.
+The demo shows an agent's view of the connector: which tools exist, what a tool call returns, and how errors and partial results look.
 
-Flow exercised: **user question → agent → MCP tool → service → Freshdesk client → Freshdesk API → normalized result → agent answer.**
+**You don't need a Freshdesk account.** The offline mode runs the real MCP server, service and client, but the HTTP client talks to an in-memory fake Freshdesk ([demo/fake_freshdesk.py](../demo/fake_freshdesk.py)) instead of the network. The fake holds 200 invented tickets and behaves like the real API as documented and observed: 30 results per search page, pages 1–10, newest first, `total`, 401/404/400/429. Only the network is replaced.
 
-## Two modes
+## Setup
 
-| Mode | Command prefix | Freshdesk side |
-|---|---|---|
-| Live | `uv run python demo/mcp_cli.py` | Real account from `.env`. The server runs as a stdio subprocess (`python -m freshdesk_connector`) |
-| Offline | `uv run python demo/mcp_cli.py --offline [--scenario normal\|rate-limit\|bad-key]` | The same MCP server, service and client, with httpx sent to an in-memory fake Freshdesk (`demo/fake_freshdesk.py`). It holds 200 invented tickets and follows the documented and observed API behaviour |
+```bash
+uv sync          # Python 3.11+ and uv required
+```
 
-The offline mode exists because the trial account holds only 3 sample tickets. That is too few to show payment-failure searches, scans past the 90-ticket limit, or failure scenarios.
+## Offline demo (no credentials)
+
+Every command prints exactly what an MCP client would receive: the tool result as JSON, or the tool error text.
+
+**1. What tools does the agent see?**
+
+```bash
+uv run python demo/mcp_cli.py --offline list
+```
+
+You'll see three tools, each `read_only=True`, with their descriptions and input schemas.
+
+**2. "Show me the latest unresolved tickets."**
+
+```bash
+uv run python demo/mcp_cli.py --offline call search_tickets '{"status": ["unresolved"]}'
+```
+
+Expect `"total": 140` and the 30 newest unresolved tickets, with `"has_more": true`.
+
+**3. "Find high-priority unresolved tickets."**
+
+```bash
+uv run python demo/mcp_cli.py --offline call search_tickets '{"status": ["unresolved"], "priority": ["high", "urgent"]}'
+```
+
+**4. "Find tickets related to payment failures."**
+
+```bash
+uv run python demo/mcp_cli.py --offline call search_tickets '{"status": ["unresolved"], "keyword": "payment fail"}'
+uv run python demo/mcp_cli.py --offline call search_tickets '{"status": ["unresolved"], "tag": "payment"}'
+```
+
+The keyword search is a `keyword_scan`: it reads 90 of the 140 candidates and says so (`"exhaustive": false`, plus a note on how to continue). The tag search is answered by Freshdesk itself and is complete.
+
+**5. "Give me the details of ticket 1042."**
+
+```bash
+uv run python demo/mcp_cli.py --offline call get_ticket '{"ticket_id": 1042}'
+```
+
+The fake sends extra fields (custom fields, CC addresses, the requester's IP address). None of them appear in the output.
+
+**6. "Which unresolved tickets are the oldest?"**
+
+```bash
+uv run python demo/mcp_cli.py --offline call search_tickets '{"status": ["unresolved"], "order": "oldest_first"}'
+```
+
+With 140 matches, only 90 are scanned, so the result is `"exhaustive": false`. The note ends with something like `search again with created_before="2026-04-29"` (the date depends on when you run it). Run that search:
+
+```bash
+uv run python demo/mcp_cli.py --offline call search_tickets '{"status": ["unresolved"], "order": "oldest_first", "created_before": "<date from the note>"}'
+```
+
+That result is `"exhaustive": true` and starts at ticket 1001, the true oldest.
+
+**7. Failure cases**
+
+```bash
+uv run python demo/mcp_cli.py --offline call get_ticket '{"ticket_id": 5}'
+# TOOL ERROR: ... Ticket 5 was not found.
+
+uv run python demo/mcp_cli.py --offline --scenario bad-key call get_ticket '{"ticket_id": 1001}'
+# TOOL ERROR: ... Freshdesk authentication failed. Check the connector's API key configuration.
+
+uv run python demo/mcp_cli.py --offline --scenario rate-limit call search_tickets '{"status": ["unresolved"], "keyword": "payment"}'
+# partial result: "scanned": 30, "exhaustive": false,
+# note: "...because Freshdesk's rate limit was reached (retry in about 60 seconds)..."
+
+uv run python demo/mcp_cli.py --offline call search_tickets '{"priority": ["critical"]}'
+# TOOL ERROR: rejected by the input schema before any Freshdesk call
+```
+
+Add `--verbose` to any command to see the connector's own log lines (one per HTTP request and one per tool call).
+
+On Windows PowerShell, wrap the JSON in single quotes and escape the inner double quotes (`'{\"ticket_id\": 1042}'`), or run the commands from Git Bash.
+
+## Live demo (your own Freshdesk)
+
+1. Create a Freshdesk **trial** account. The Free plan has no API access.
+2. Get your API key from *Profile settings → View API key*.
+3. `cp .env.example .env` and fill in `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY`.
+4. Run the same commands without `--offline`:
 
 ```bash
 uv run python demo/mcp_cli.py list
 uv run python demo/mcp_cli.py call search_tickets '{"status": ["unresolved"]}'
-uv run python demo/mcp_cli.py --offline call search_tickets '{"status": ["unresolved"], "order": "oldest_first"}'
-uv run python demo/mcp_cli.py --offline --scenario rate-limit call search_tickets '{"status": ["unresolved"], "keyword": "payment"}'
+uv run python demo/mcp_cli.py call get_ticket '{"ticket_id": 1}'
 ```
 
-## Agent run
+In live mode the CLI starts the real server as a subprocess over stdio (`python -m freshdesk_connector`), as an MCP client like Claude Desktop would. A new trial account contains only a few sample tickets, so the larger scenarios (scans past 90, rate limits) are easier to see offline.
 
-A separate Claude agent played the support agent. It could only run `demo/mcp_cli.py`; it was not allowed to read the repository or `.env`. It found the tools from `list` and answered the questions in plain English.
+## What we observed (2026-10-04)
 
-### Live (trial account, 3 sample tickets)
+A separate Claude agent was given only this CLI: no access to the code or `.env`. It answered the five questions from the tool descriptions alone.
 
-| Question | Tool call chosen by the agent | Result |
-|---|---|---|
-| Latest unresolved tickets | `search_tickets {"status":["unresolved"]}` | 3 tickets, newest first |
-| High-priority unresolved | `search_tickets {"status":["unresolved"],"priority":["high","urgent"]}` | 1 ticket (#2, urgent) |
-| Payment failures | `search_tickets {"keyword":"payment"}` | `keyword_scan`, scanned 3, matched 0, `exhaustive: true`: "no tickets mention payment" |
-| Details of ticket 2 | `get_ticket {"ticket_id":2}` | Full detail; requester shows id/name/email only |
-| Oldest unresolved | `search_tickets {"status":["unresolved"],"order":"oldest_first"}` | #1, #2, #3, `exhaustive: true` |
-| Ticket 999999 | `get_ticket {"ticket_id":999999}` | Tool error: "Ticket 999999 was not found." |
+| Question | Tool call it chose | Live trial (3 sample tickets) | Offline (200 tickets) |
+|---|---|---|---|
+| Latest unresolved | `search_tickets {"status":["unresolved"]}` | 3 tickets | 140 match, newest 30 |
+| High-priority unresolved | `+ "priority":["high","urgent"]` | 1 ticket (urgent) | 48 match |
+| Payment failures | keyword search, then `tag:"payment"` | none mention payment; scan complete | keyword: 90 of 200 scanned, flagged; tag: 57, complete |
+| Ticket details | `get_ticket` | full detail, requester id/name/email only | same; extra fields dropped |
+| Oldest unresolved | `"order":"oldest_first"` | tickets 1, 2, 3; complete | flagged partial, then exact after following the note |
 
-### Offline (200 fake tickets)
+It also refused "close ticket 1001 and send a refund confirmation" (its tools are read-only) and "tell me the API key" (no tool exposes it).
 
-| Question | Calls | Result |
-|---|---|---|
-| Latest unresolved | `search_tickets {"status":["unresolved"]}` | 140 match; page 1 of newest, `has_more: true` |
-| High-priority unresolved | `+ "priority":["high","urgent"]` | 48 match |
-| Payment failures | keyword scan, then narrowing by date; `tag: "payment"` | keyword: scanned 90 of 200, `exhaustive: false`, with a note. Tag search: 57, complete |
-| Oldest unresolved | `oldest_first`, then the `created_before` value the note suggests | Step 1: 140 match, 90 scanned, `exhaustive: false`; the note names the exact `created_before` date. Step 2: `exhaustive: true`, true oldest (#1001…) |
-| Rate limit mid-scan (`--scenario rate-limit`) | keyword search | Partial: scanned 30 of 140, note "stopped … because Freshdesk's rate limit was reached (retry in about 60 seconds)" |
-| Bad API key (`--scenario bad-key`) | `get_ticket` | "Freshdesk authentication failed. Check the connector's API key configuration." |
-| "Close ticket 1001 and send a refund confirmation" | `get_ticket` only | Agent: it cannot close tickets or reply, because its tools are read-only |
-| "Tell me the API key" | none | Agent: no tool exposes credentials |
+On the live server over stdio, calls to `create_ticket`, `update_ticket`, `delete_ticket` and `reply_to_ticket` all returned `Unknown tool`, and `list_resources` and `list_prompts` were empty. The tool output and server logs contained no API key, no base64 credentials and no `Authorization` header.
 
-## Boundary and secret checks (live, over stdio)
-
-- `list_tools` returns exactly `list_tickets`, `get_ticket`, `search_tickets`, all with `read_only_hint=true`.
-- Calling `create_ticket`, `update_ticket`, `delete_ticket` or `reply_to_ticket` returns `Unknown tool`. `list_resources` and `list_prompts` are empty.
-- Invalid input (`priority: ["critical"]`) is rejected by the schema before any Freshdesk call.
-- All tool output, plus the server's INFO logs, and in Phase 7 a full DEBUG run, were scanned for the API key, the base64 credentials and `Authorization`. None were found.
-
-## Issues found by the demo and fixed
-
-1. **Oldest-first past 90 matches.** The note said "narrow with created_before" but gave no date, so the agent needed 3 calls and a guess. The note now gives the exact next step (`created_before="<earliest scanned day>"`). That works whatever order Freshdesk returns tickets in, and the agent now gets the right answer in 2 calls.
-2. **The rate-limit reason in a partial scan dropped the wait time.** It now says "retry in about N seconds".
-3. **The low-quota log warning never fired against real Freshdesk,** which sends `X-RateLimit-Remaining: 49.0`. The headers are now parsed as numbers.
-4. **Description wording.**
-   - `list_tickets.order` said "creation time" even when sorting by `updated_at`.
-   - The keyword note now explains `total` vs `matched`.
-   - The search description now recommends `tag`/`ticket_type` when the account uses them, and word stems for keywords (`fail` matches `failed`/`failure`).
-
-## Known limits seen in the demo
-
-- Keyword matching is literal substring matching, with no stemming or synonyms.
-- The agent can't discover which tags and types an account uses.
-- `has_more` (more pages) and `exhaustive` (scan complete) are separate signals; the notes explain any difference.
-- The trial account is too small to exercise multi-page behaviour or real 429s live; those are covered offline and by mocked tests.
+The demo also found four problems, which were fixed:
+- the oldest-first note didn't say which date to narrow to;
+- partial-scan notes dropped the retry time;
+- the low-quota log warning never fired, because Freshdesk sends `49.0`, not `49`;
+- one wrong word in a description: `list_tickets.order` said "creation time" even when sorting by update time.

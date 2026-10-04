@@ -1,9 +1,9 @@
 """In-memory stand-in for the Freshdesk v2 API, for the offline demo only.
 
-It mimics the behaviour documented and observed in docs/02 (30 results per search
-page, pages 1-10, newest first, `total`, 30-day list window, Link header, 401/404/
-400/429) over a deterministic set of invented tickets. All names, emails and
-ticket contents are fake.
+It mimics the behaviour in docs/freshdesk-api-notes.md (30 results per search page,
+pages 1-10, newest first, `total`, 30-day list window, Link header, 401/404/400/429)
+over a deterministic set of invented tickets. All names, emails and ticket contents
+are fake.
 """
 
 import json
