@@ -135,6 +135,13 @@ async def test_search_tickets_quotes_query_and_parses_total(api, client):
     assert params["page"] == ["2"]
 
 
+async def test_list_ticket_fields(api, client):
+    fields = [{"name": "status", "choices": {"2": ["Open", "Open"]}}]
+    api.get("/ticket_fields").respond(200, json=fields)
+
+    assert await client.list_ticket_fields() == fields
+
+
 async def test_requests_use_basic_auth_with_api_key(api, client):
     route = api.get("/tickets/1").respond(200, json={"id": 1})
 
@@ -350,6 +357,7 @@ async def test_invalid_json_raises_unexpected_response(api, client):
         ("/tickets/1", [1, 2], lambda c: c.get_ticket(1)),
         ("/search/tickets", {"results": []}, lambda c: c.search_tickets("status:2")),
         ("/search/tickets", [], lambda c: c.search_tickets("status:2")),
+        ("/ticket_fields", {"not": "a list"}, lambda c: c.list_ticket_fields()),
     ],
 )
 async def test_wrong_shape_raises_unexpected_response(api, client, path, body, call):
@@ -405,17 +413,19 @@ async def test_api_key_never_in_errors_or_logs(api, client, caplog, response):
 
 def test_client_exposes_only_read_operations():
     public = {name for name in dir(FreshdeskClient) if not name.startswith("_")}
-    assert public == {"list_tickets", "get_ticket", "search_tickets"}
+    assert public == {"list_tickets", "get_ticket", "search_tickets", "list_ticket_fields"}
 
 
 async def test_all_requests_are_get(api, client):
     api.get("/tickets").respond(200, json=[])
     api.get("/tickets/1").respond(200, json={"id": 1})
     api.get("/search/tickets").respond(200, json={"results": [], "total": 0})
+    api.get("/ticket_fields").respond(200, json=[])
     api.route().respond(500)  # any non-GET would land here and fail the calls below
 
     await client.list_tickets()
     await client.get_ticket(1)
     await client.search_tickets("status:2")
+    await client.list_ticket_fields()
 
     assert {call.request.method for call in api.calls} == {"GET"}
